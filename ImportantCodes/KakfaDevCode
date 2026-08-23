@@ -1,0 +1,85 @@
+# Databricks notebook source
+# MAGIC %pip install confluent-kafka[avro,json,protobuf]==2.7.0 
+
+# COMMAND ----------
+
+import certifi
+from pyspark.sql.functions import expr
+from pyspark.sql.avro.functions import from_avro
+from confluent_kafka.schema_registry import SchemaRegistryClient
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC DBTITLE 1,Kafka & Schema Registry Secrets  
+# MAGIC ca_crt_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/caroot.crt"  
+# MAGIC ca_pem_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/ca.pem"  
+# MAGIC key_pem_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/key.pem"  
+
+# COMMAND ----------
+
+
+# DBTITLE 1,Kafka & Schema Registry Secrets
+ca_crt_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/caroot.crt"
+ca_pem_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/ca.pem"
+key_pem_location = "/dbfs/mnt/blob-storage-certificates/retina_certificates/key.pem"
+
+kafkaBootstrapServers = dbutils.secrets.get(scope="kyvazew_anl009aliancabi", key="kafka-retina-bootstrap-servers")
+kafkaUser = dbutils.secrets.get(scope="kyvazew_anl009aliancabi", key="kafka-retina-user-EcargoP")
+kafkaSecret = dbutils.secrets.get(scope="kyvazew_anl009aliancabi", key="kafka-retina-secret-EcargoP")
+schemaRegistryUrl = dbutils.secrets.get(scope="kyvazew_anl009aliancabi", key="kafka-retina-schema-registry-url-EcargoP")
+consumerGroup = dbutils.secrets.get(scope="kyvazew_anl009aliancabi", key="kafka-retina-consumer-group-EcargoP")
+
+# COMMAND ----------
+
+# DBTITLE 1,Topic Config
+topicName = "anl.document.move.topic.internal.any.v2"
+groupName = consumerGroup
+
+# COMMAND ----------
+
+# DBTITLE 1,Retrieve Avro Schema from Schema Registry
+schema_registry_conf = {
+    'url': schemaRegistryUrl,
+    'ssl.ca.location': ca_crt_location,
+    'ssl.certificate.location': ca_pem_location,
+    'ssl.key.location': key_pem_location
+}
+
+schema_registry_client = SchemaRegistryClient(schema_registry_conf)
+move_schema_response = schema_registry_client.get_latest_version(topicName + "-value").schema
+move_schema = move_schema_response.schema_str
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Read Topic Data (Batch Snapshot)
+df_kafka = (
+    spark.read
+    .format("kafka")
+    .option("kafka.bootstrap.servers", kafkaBootstrapServers)
+    .option("kafka.sasl.jaas.config", "kafkashaded.org.apache.kafka.common.security.scram.ScramLoginModule required username='{}' password='{}';".format(kafkaUser, kafkaSecret))
+    .option("kafka.security.protocol", "SASL_SSL")
+    .option("kafka.sasl.mechanism", "SCRAM-SHA-512")
+    .option("kafka.ssl.truststore.type", "PEM")
+    .option("kafka.ssl.truststore.location", ca_crt_location)
+    .option("subscribe", topicName)
+    .option("kafka.group.id", groupName)
+    .option("failOnDataLoss", "false")
+    .option("startingOffsets", "earliest")
+    .option("endingOffsets", "latest")
+    .load()
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Deserialize Avro & Build Final DataFrame
+from_avro_options = {"mode": "PERMISSIVE"}
+
+df_move = (
+    df_kafka
+    .select(from_avro(expr("substring(value, 6, length(value)-5)"), move_schema, from_avro_options).alias("value"), "timestamp")
+    .selectExpr("value.*", "timestamp")
+)
+
+display(df_move)
